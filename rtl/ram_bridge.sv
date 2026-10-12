@@ -98,7 +98,7 @@ module ram_bridge(
     reg [7:0] bram_din;
     reg [7:0] bram_dout;
     reg bram_we;
-    wire is_base_ram /* synthesis keep */ = addr[22:16] == 7'd2; // The base RAM (64K), shaved with video
+    wire is_base_ram /* synthesis keep */ = addr[22:16] == 7'd2; // The base RAM (64K), shared with video
     always @(posedge clk) begin
         reg last_we = 1'b0;
         reg last_oe = 1'b0;
