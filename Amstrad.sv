@@ -26,7 +26,29 @@ assign ADC_BUS  = 'Z;
 assign USER_OUT = '1;
 assign {UART_RTS, UART_TXD, UART_DTR} = 0;
 assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
-assign {DDRAM_CLK, DDRAM_BURSTCNT, DDRAM_ADDR, DDRAM_DIN, DDRAM_BE, DDRAM_RD, DDRAM_WE} = 0;
+
+
+assign SDRAM_DQ  = 'Z;
+assign SDRAM_A   = '0;
+assign SDRAM_BA  = '0;
+assign SDRAM_DQML = 1;
+assign SDRAM_DQMH = 1;
+assign SDRAM_nCS  = 1;
+assign SDRAM_nCAS = 1;
+assign SDRAM_nRAS = 1;
+assign SDRAM_nWE  = 1;
+assign SDRAM_CLK  = 0;
+assign SDRAM_CKE  = 0;
+
+// Core RAM now lives on PSRAM, so the HPS DDR3 (DDRAM_*) path is unused.
+// Tie the DDRAM_* outputs off so sysmem ram1 stays idle.
+assign DDRAM_CLK  = 0;
+assign DDRAM_BURSTCNT = 0;
+assign DDRAM_ADDR = 0;
+assign DDRAM_RD   = 0;
+assign DDRAM_DIN  = 0;
+assign DDRAM_BE   = 0;
+assign DDRAM_WE   = 0;
 
 assign LED_USER  = mf2_en | ioctl_download | tape_led | tape_adc_act;
 assign LED_DISK  = 0;
@@ -104,15 +126,17 @@ localparam CONF_STR = {
 //////////////////////////////////////////////////////////////////////////
 
 wire clk_sys;
+wire clk_ram;
 wire locked;
 wire st_right_shift_mod = status[22];
 wire st_keypad_mod = status[23];
 wire st_progressbar = status[31];
-
+wire clk_psram = clk_ram;
 pll pll
 (
 	.refclk(CLK_50M),
 	.outclk_0(clk_sys),
+    .outclk_1(clk_ram),
 	.locked(locked)
 );
 
@@ -149,6 +173,10 @@ wire        ioctl_download;
 wire  [7:0] ioctl_index;
 wire [31:0] ioctl_file_ext;
 wire        ioctl_wait;
+
+// SignalTap probe of ioctl_index (preserved; no functional role)
+(* noprune *) reg [7:0] dbg_ioctl;
+always @(posedge clk_sys) dbg_ioctl <= ioctl_index;
 
 wire [10:0] ps2_key;
 wire [24:0] ps2_mouse;
@@ -316,7 +344,7 @@ always @(posedge clk_sys) begin
 			sna_rle_state <= 2'd0;
 		end
 	end
-	else if((rom_download | dan_download | sna_mem_wr)  & ioctl_wr) begin
+	else if((sna_mem_wr | rom_download | dan_download) & ioctl_wr & ~romdl_wait) begin
 		romdl_wait <= 1;
 		boot_dout <= ioctl_dout;
 
@@ -326,24 +354,30 @@ always @(posedge clk_sys) begin
 			boot_bank <= sna_model;
 			boot_a[22:14] <= 9'd8 + {6'd0, sna_mem_addr[16:14]};
 			boot_a[13:0] <= sna_mem_addr[13:0];
-		end
+end
 		else if (dan_download) begin
-			boot_bank <= 2'b11;
-			boot_a[22:14] <= ioctl_addr[22:14];
-		end 
+			if(ioctl_addr[22:14] <= 9'h07F) begin
+				boot_bank   <= 2'b11;
+				boot_a[22:14] <= ioctl_addr[22:14];
+			end
+			else romdl_wait <= 0;
+		end
 		else if(ioctl_index) begin
-			boot_a[22]    <= page[8];
-			boot_a[21:14] <= page[7:0] + ioctl_addr[21:14];
-			boot_bank     <= (ioctl_index == 7) ? 2'd2 : {1'b0, &ioctl_index[7:6]};
+			if(page[8] || (({1'b0, page[7:0]} + {1'b0, ioctl_addr[21:14]}) > 9'h07F)) romdl_wait <= 0;
+			else begin
+				boot_a[22]    <= page[8];
+				boot_a[21:14] <= page[7:0] + ioctl_addr[21:14];
+				boot_bank     <= (ioctl_index == 7) ? 2'd2 : {1'b0, &ioctl_index[7:6]};
+			end
 		end
 		else begin
 			case(ioctl_addr[24:14])
 					0,4: boot_a[22:14] <= 9'h000; //OS
-					1,5: boot_a[22:14] <= 9'h100; //BASIC
-					2,6: boot_a[22:14] <= 9'h107; //AMSDOS
-					3,7: boot_a[22:14] <= 9'h0ff; //MF2
+					1,5: boot_a[22:14] <= 9'h040; //BASIC
+					2,6: boot_a[22:14] <= 9'h047; //AMSDOS
+					3,7: boot_a[22:14] <= 9'h03f; //MF2
 					8:   boot_a[22:14] <= 9'h000; //CPC464 OS
-					9:   boot_a[22:14] <= 9'h100; //CPC464 BASIC
+					9:   boot_a[22:14] <= 9'h040; //CPC464 BASIC
 			  default:    romdl_wait <= 0;
 			endcase
 
@@ -363,7 +397,7 @@ always @(posedge clk_sys) begin
 			if(rom_download && (ioctl_index[7:6]==1 || ioctl_index[5:0]) && !boot_bank) boot_bank <= 1;
 			else begin
 				{boot_wr, romdl_wait} <= 0;
-				if(boot_a[22]) rom_map[boot_a[21:14]] <= 1;
+				if(boot_a[20]) rom_map[boot_a[19:14]] <= 1;
 				if(combo && &boot_a[13:0]) begin
 					combo <= 0;
 					page  <= 9'h1FF;
@@ -601,22 +635,34 @@ wire        mem_rd;
 wire [22:0] ram_a;
 wire  [7:0] ram_dout;
 
+wire rdy;
+
+// Select the boot/loader path with the combinational download conditions, not
+// just the registered `reset`. `reset` latches one clk_sys edge after
+// rom_download first asserts; a boot_wr pulse riding in that window would be
+// routed to the CPU path and the first boot byte lost (silicon-only race, sim-
+// invisible). use_boot pins the loader path for the whole download window.
+wire boot_load = rom_download | dan_download | sna_mem_wr;
+wire use_boot = reset | boot_load;
+
 wire [15:0] vram_dout;
 wire [14:0] vram_addr;
 
-sdram sdram
-(
-	.*,
-
+ram_bridge ram_bridge(
 	.init(~locked),
-	.clk(clk_sys),
-	.clkref(ce_ref),
+	.clk(clk_ram),
+	.PSRAM_SCLK(PSRAM_SCLK),
+	.PSRAM_CE_N(PSRAM_CE_N),
+	.PSRAM_SIO_OUT(PSRAM_SIO_OUT),
+	.PSRAM_SIO_OE(PSRAM_SIO_OE),
+	.PSRAM_SIO_IN(PSRAM_SIO_IN),
 
-	.oe  (reset ? 1'b0      : mem_rd & ~mf2_ram_en),
-	.we  (reset ? boot_wr   : mem_wr & ~mf2_ram_en & ~mf2_rom_en),
-	.addr(reset ? boot_a    : mf2_rom_en ? {9'h0ff, cpu_addr[13:0]} : dan_ena ? {4'd0, dan_bank, cpu_addr[13:0]} : ram_a),
-	.bank(reset ? boot_bank : dan_ena ? 2'b11 : model),
-	.din (reset ? boot_dout : cpu_dout),
+	.oe  (use_boot ? 1'b0      : mem_rd & ~mf2_ram_en),
+	.we  (use_boot ? boot_wr   : mem_wr & ~mf2_ram_en & ~mf2_rom_en),
+	.addr(use_boot ? boot_a    : mf2_rom_en ? {9'h03f, cpu_addr[13:0]} : dan_ena ? {4'd0, dan_bank, cpu_addr[13:0]} : ram_a),
+	.bank(use_boot ? boot_bank : dan_ena ? 2'b11 : model),
+	.din (use_boot ? boot_dout : cpu_dout),
+	.boot_load(boot_load),
 	.dout(ram_dout),
 	.vram_bank(model),
 	.vram_addr({2'b10,vram_addr,1'b0}),
@@ -627,7 +673,7 @@ sdram sdram
 	.tape_dout(tape_dout),
 	.tape_wr(tape_wr),
 	.tape_wr_ack(tape_wr_ack),
-	.tape_rd(tape_data_req ^ tape_data_ack),
+	.tape_rd((tape_data_req ^ tape_data_ack) & ~ioctl_download),
 	.tape_rd_ack(tape_data_ack)
 );
 

@@ -26,6 +26,8 @@ module sys_top
 	input         FPGA_CLK2_50,
 	input         FPGA_CLK3_50,
 
+	output        clk_50m,
+
 	//////////// HDMI //////////
 	output        HDMI_I2C_SCL,
 	inout         HDMI_I2C_SDA,
@@ -55,6 +57,13 @@ module sys_top
 	output  [1:0] SDRAM_BA,
 	output        SDRAM_CLK,
 	output        SDRAM_CKE,
+
+	//////////// PSRAM ///////////
+	output        PSRAM_SCLK,
+	output        PSRAM_CE_N,
+	output  [3:0] PSRAM_SIO_OUT,
+	output  [3:0] PSRAM_SIO_OE,
+	input   [3:0] PSRAM_SIO_IN,
 
 `ifdef MISTER_DUAL_SDRAM
 	////////// SDR #2 //////////
@@ -153,8 +162,9 @@ wire led_d =  led_disk[1]  ? ~led_disk[0]  : ~(led_disk[0] | gp_out[29]);
 wire led_u = ~led_user;
 wire led_locked;
 
-//LEDs on de10-nano board
-assign LED = (led_overtake & led_state) | (~led_overtake & {1'b0,led_locked,1'b0, ~led_p, 1'b0, ~led_d, 1'b0, ~led_u});
+// Chameleon96: bits 1/3 carry the two RF LEDs (yellow=video-active,
+// blue=always-on) as active-high "1=lit" like bits 5/6, so UIO_LEDS overrides them.
+assign LED = (led_overtake & led_state) | (~led_overtake & {1'b0, led_locked, 1'b0, ~led_p, 1'b1, ~led_d, HDMI_TX_DE, ~led_u});
 
 wire [2:0] mcp_btn;
 wire       mcp_sdcd;
@@ -607,6 +617,7 @@ sysmem_lite sysmem
 	.reset_core_req(reset_req),
 	.reset_out(reset),
 	.clock(clk_100m),
+	.clk_50m(clk_50m),
 
 	//DE10-nano has no reset signal on GPIO, so core has to emulate cold reset button.
 	.reset_hps_cold_req(btn_r),
@@ -713,7 +724,7 @@ wire         bob_deint;
 
 	ascal 
 	#(
-		.RAMBASE(32'h20000000),
+		.RAMBASE(32'h1E800000),
 	`ifdef MISTER_SMALL_VBUF
 		.RAMSIZE(32'h00200000),
 	`else
@@ -1180,7 +1191,7 @@ cyclonev_hps_interface_peripheral_i2c hdmi_i2c
 	wire [23:0] hdmi_data_osd;
 	wire        hdmi_de_osd, hdmi_vs_osd, hdmi_hs_osd;
 
-	osd hdmi_osd
+	osd #(.OSD_COLOR(1)) hdmi_osd
 	(
 		.clk_sys(clk_sys),
 
@@ -1756,6 +1767,7 @@ wire [13:0] fb_stride;
 emu emu
 (
 	.CLK_50M(FPGA_CLK2_50),
+	.CLK_100M(clk_100m),
 	.RESET(reset),
 	.HPS_BUS({f1, HDMI_TX_VS, 
 				 clk_100m, clk_ihdmi,
@@ -1842,6 +1854,12 @@ emu emu
 	.SDRAM_nCAS(SDRAM_nCAS),
 	.SDRAM_CLK(SDRAM_CLK),
 	.SDRAM_CKE(SDRAM_CKE),
+
+	.PSRAM_SCLK(PSRAM_SCLK),
+	.PSRAM_CE_N(PSRAM_CE_N),
+	.PSRAM_SIO_OUT(PSRAM_SIO_OUT),
+	.PSRAM_SIO_OE(PSRAM_SIO_OE),
+	.PSRAM_SIO_IN(PSRAM_SIO_IN),
 
 `ifdef MISTER_DUAL_SDRAM
 	.SDRAM2_DQ(SDRAM2_DQ),

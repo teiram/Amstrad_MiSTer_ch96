@@ -75,7 +75,7 @@ end
 
 always @(*) begin
 	casex({romen_n, RAMmap, A[15:14]})
-		'b0_xxx_xx: ram_A[22:14] = {9{A[15]}} & {1'b1, ROMbank};  // lower/upper rom
+		'b0_xxx_xx: ram_A[22:14] = {9{A[15]}} & {3'b001, ROMbank[5:0]};  // lower/upper rom
 		'b1_0x1_11,                                               // map1&3 bank3
 		'b1_010_xx: ram_A[22:14] = {2'b00, RAMpage,    A[15:14]}; // map2   bank0-3 (ext  0..3)
 		'b1_011_01: ram_A[22:14] = {2'b00,    5'd2,       2'b11}; // map3   bank1   (base 3)
