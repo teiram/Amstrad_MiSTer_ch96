@@ -65,6 +65,12 @@ module sys_top
 	output  [3:0] PSRAM_SIO_OE,
 	input   [3:0] PSRAM_SIO_IN,
 
+	output        PSRAM2_SCLK,
+	output        PSRAM2_CE_N,
+	output  [3:0] PSRAM2_SIO_OUT,
+	output  [3:0] PSRAM2_SIO_OE,
+	input   [3:0] PSRAM2_SIO_IN,
+
 `ifdef MISTER_DUAL_SDRAM
 	////////// SDR #2 //////////
 	output [12:0] SDRAM2_A,
@@ -1861,6 +1867,12 @@ emu emu
 	.PSRAM_SIO_OE(PSRAM_SIO_OE),
 	.PSRAM_SIO_IN(PSRAM_SIO_IN),
 
+	.PSRAM2_SCLK(PSRAM2_SCLK),
+	.PSRAM2_CE_N(PSRAM2_CE_N),
+	.PSRAM2_SIO_OUT(PSRAM2_SIO_OUT),
+	.PSRAM2_SIO_OE(PSRAM2_SIO_OE),
+	.PSRAM2_SIO_IN(PSRAM2_SIO_IN),
+    
 `ifdef MISTER_DUAL_SDRAM
 	.SDRAM2_DQ(SDRAM2_DQ),
 	.SDRAM2_A(SDRAM2_A),
