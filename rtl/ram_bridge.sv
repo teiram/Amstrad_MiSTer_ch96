@@ -142,7 +142,8 @@ module ram_bridge #(
     psram #(
         .PWRUP_CYCLES(PWRUP_CYCLES),
         .RST_CYCLES(RST_CYCLES),
-        .MID_CYCLES(MID_CYCLES)
+        .MID_CYCLES(MID_CYCLES),
+        .LEAN(1)      // stage 2: lean drain (pick-only tap, depth 2+c/2)
     ) psram1 (
         .clk    (clk),
         .reset  (~rst_n),
@@ -168,7 +169,8 @@ module ram_bridge #(
     psram #(
         .PWRUP_CYCLES(PWRUP_CYCLES),
         .RST_CYCLES(RST_CYCLES),
-        .MID_CYCLES(MID_CYCLES)
+        .MID_CYCLES(MID_CYCLES),
+        .LEAN(1)      // stage 2: lean drain (pick-only tap, depth 2+c/2)
     ) psram2 (
         .clk    (clk),
         .reset  (~rst_n),

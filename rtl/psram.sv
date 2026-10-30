@@ -30,9 +30,20 @@ module psram #(
     //
     // cycles between CE# release and result assembly (sample-history drain).
     // 5 is the verified v3 value (sized for the worst-case cap_sel=7 pipeline);
-    // stage 2 of the bring-up will lower it to 2 + cap_sel/2 via the board
-    // takeover without touching the capture logic.
-    parameter integer DRAIN        = 5
+    // LEAN=1 (stage 2) ignores it and uses 2 + cap_sel/2 per frame instead.
+    parameter integer DRAIN        = 5,
+    //
+    // Stage 2 ("lean drain", board-booted variant):
+    //   * write always from `pick` (the 3-stage tap; content X(n-3) == what the
+    //     v3 per-c tap chain delivered, arrived earlier: identical sample
+    //     because the pad capture instants are untouched),
+    //   * write-enabling fire depth 2 + cap_sel/2,
+    //   * frame drain 2 + cap_sel/2 (same as the fire depth, so the result is
+    //     always on the tap >= 1 cycle before fread)
+    // The pad capture, rd_ext (device CE hold) and the calibration window are
+    // NOT touched: still the v3 rig silicon behaviour, just less fabric-side
+    // wait. LEAN=0 keeps the 100 % v3-verbatim behaviour.
+    parameter integer LEAN         = 0
 ) (
     input clk,
     input reset,
@@ -59,7 +70,28 @@ module psram #(
         WR2 = 2'd2,
         RD2 = 2'd3;
 
-    // DRAIN comes from the module parameter (see header). No local override.
+    // ---- lean stage-2 drainer: write-enable depths and result tap ----
+    //
+    // Information:
+    //   cap_en_s registers 1 cycle after the frame counter reaches the first
+    //   capture period (we count from the pp warehouse, not the device). So a
+    //   write fired at cap_en_dn happens n cycles after pp held the sample of
+    //   period (15+i): content period = 15+i + (n - 2 - (tap chain steps - 1)).
+    //   v3 always writes at n=5 with tap chain 3-c/2 -> content 15+i+c/2 for
+    //   every c. The LEAN path writes from `pick` (1 chain step, content
+    //   n-3-(1-1) = n-3 from pp+3) at depth 2+c/2 -> 15+i+c/2 + ... identical
+    //   content, 1..3 cycles earlier.
+    reg [1:0] dsel = 2'd3;    // fire depth offset: depth = 2 + dsel (2..5)
+
+    reg cap_en_fire;
+    always @* begin
+        case (dsel)
+            2'd0:    cap_en_fire = cap_en_d2;
+            2'd1:    cap_en_fire = cap_en_d3;
+            2'd2:    cap_en_fire = cap_en_d4;
+            default: cap_en_fire = cap_en_d5;   // v3: always the 5th stage
+        endcase
+    end
 
     localparam [2:0]
         ST_PWRUP = 3'd0,
@@ -196,8 +228,9 @@ module psram #(
             cap_en_s <= framer && is_rd(fop) &&
                 (fpcnt >= cap_first(fop)) &&
                 (fpcnt < cap_first(fop) + cap_count(fop));
-            // five more stages: the multi-phase sample pipeline needs 5 cycles
-            // after the original capture edge before its newest entry is usable.
+            // five more stages: the multi-phase sample pipeline needs v3's 5
+            // cycles after the original capture edge before its newest entry
+            // is usable (the lean path fires earlier: see the drainer notes).
             cap_en_d1 <= cap_en_s;
             cap_en_d2 <= cap_en_d1;
             cap_en_d3 <= cap_en_d2;
@@ -237,14 +270,20 @@ module psram #(
 
     // Nibble i is written at W = 22+i; period k = 15+i+c/2 is then in
     // tap (3 - c/2): pick, pk0, pk1, pk2.
+    // Lean (stage 2): always `pick` -- at fire depth 2+c/2 its content is the
+    // same nibble the v3 chain delivered at depth 5 (see the drainer notes).
     reg [3:0] cap_tap;
     always @* begin
-        case (sel_q[2:1])
-            2'd3:    cap_tap = pick;
-            2'd2:    cap_tap = pk0;
-            2'd1:    cap_tap = pk1;
-            default: cap_tap = pk2;
-        endcase
+        if (LEAN != 0) begin
+            cap_tap = pick;
+        end else begin
+            case (sel_q[2:1])
+                2'd3:    cap_tap = pick;
+                2'd2:    cap_tap = pk0;
+                2'd1:    cap_tap = pk1;
+                default: cap_tap = pk2;
+            endcase
+        end
     end
 
     // ------------------------------------------------------- TX / engine core
@@ -362,11 +401,21 @@ module psram #(
     task automatic frame_go(input [1:0] op, input integer len,
                             input [7:0] cmd, input [23:0] ba,
                             input [7:0] d0, input [7:0] d1);
+        integer drain;
         begin
             fop <= op;
             ce_m1   = len - 1 + (is_rd(op) ? rd_ext(cap_sel) : 0);
-            flen_m1 = ce_m1   + (is_rd(op) ? DRAIN           : 0);
+            if (is_rd(op)) begin
+                if (LEAN != 0)
+                    drain = 2 + cap_sel[2:1];          // stage 2: per-c drain
+                else
+                    drain = DRAIN;                     // v3: fixed 5
+            end
+            else drain = 0;
+            flen_m1 = ce_m1 + (is_rd(op) ? drain : 0);
             sel_q   <= cap_sel;
+            // fire depth = 2 + dsel; v3 keeps the fixed 5th stage, lean tracks c
+            dsel    <= (LEAN != 0) ? cap_sel[2:1] : 2'd3;
             s_cmd = cmd;
             raddr = ba;
             wd0 = d0;
@@ -390,7 +439,7 @@ module psram #(
             rnib[3] <= 4'h0;
             nidx    <= 2'd0;
         end else begin
-            if (cap_en_d5) begin
+            if (cap_en_fire) begin
                 rnib[nidx] <= cap_tap;
                 nidx <= nidx + 2'd1;
             end else begin

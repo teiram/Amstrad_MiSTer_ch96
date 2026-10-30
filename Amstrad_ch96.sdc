@@ -18,6 +18,8 @@ set_clock_groups -exclusive \
     -group [get_clocks { h2f_user1_clk}] \
     -group [get_clocks { *|u_sdram_pll|*|divclk}]
 
+set_false_path -from [get_clocks {sys_top|emu|pll|pll_inst|altera_pll_i|cyclonev_pll|counter[2].output_counter|divclk}]
+
 set_false_path -to   [get_ports {LED_}]
 
 set_false_path -to   {sys_top|cfg[*]}
