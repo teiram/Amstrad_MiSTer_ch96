@@ -20,6 +20,12 @@ set_clock_groups -exclusive \
 
 set_false_path -from [get_clocks {sys_top|emu|pll|pll_inst|altera_pll_i|cyclonev_pll|counter[2].output_counter|divclk}]
 
+# The cpuside memory strobes are level-held C0 (64 MHz) signals sampled at
+# 128 MHz: the transfer budget is one full T80 memory window, not the
+# TimeQuest near-coincident C0/C1 edge pairing.
+set_multicycle_path -setup 2 -from [get_clocks {sys_top|emu|pll|pll_inst|altera_pll_i|cyclonev_pll|counter[0].output_counter|divclk}] -to [get_clocks {sys_top|emu|pll|pll_inst|altera_pll_i|cyclonev_pll|counter[1].output_counter|divclk}]
+set_multicycle_path -hold 1 -from [get_clocks {sys_top|emu|pll|pll_inst|altera_pll_i|cyclonev_pll|counter[0].output_counter|divclk}] -to [get_clocks {sys_top|emu|pll|pll_inst|altera_pll_i|cyclonev_pll|counter[1].output_counter|divclk}]
+
 set_false_path -to   [get_ports {LED_}]
 
 set_false_path -to   {sys_top|cfg[*]}

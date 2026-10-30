@@ -706,9 +706,7 @@ ram_bridge ram_bridge(
 	.addr(use_boot ? boot_a    : mf2_rom_en ? {9'h03f, cpu_addr[13:0]} : dan_ena ? {4'd0, dan_bank, cpu_addr[13:0]} : ram_a),
 	.bank(use_boot ? boot_bank : dan_ena ? 2'b11 : model),
 	.din (use_boot ? boot_dout : cpu_dout),
-	.boot_load(boot_load),
 	.dout(ram_dout),
-	.vram_bank(model),
 	.vram_addr({2'b10,vram_addr,1'b0}),
 	.vram_dout(vram_dout),
 

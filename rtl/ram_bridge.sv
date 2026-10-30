@@ -24,8 +24,12 @@
 //
 // Video holding buffer: vram_dout holds the last complete 16-bit word; a new
 // fetch is queued whenever the live CRTC address moves off it, when the
-// buffer is empty, when boot_load ends, or when a mirrored write changed the
-// displayed word. No BRAM involved: PSRAM only.
+// buffer is empty, or when a mirrored write changed the displayed word.
+// No bring-up/boot_load special-casing: video reads live on the dedicated
+// chip 2, so they cannot collide with loader traffic (chip 1), and a
+// download's mirror writes keep the display following the screen being
+// built (stale words self-heal via the dirty/address-change refetch).
+// No BRAM involved: PSRAM only.
 //
 // Issue path: no req/ack toggle -- the scheduler presents rd/we plus address
 // and data while the psram controller reports ready, pulse-style, then waits
@@ -35,8 +39,7 @@
 // drop them).
 //
 // Ownership of every register lives in exactly one always block:
-//   * host capture block: edge capture, FIFO pushes/pointers, tape slot,
-//     cpu_rd_pending (cleared via the engine's rd_fin pulse), dout mux input
+//   * host capture block: edge capture, FIFO pushes/pointers, dout mux input
 //   * chip1 engine: its strobes + ops, tape acks (via a pulse reg), results
 //   * chip2 engine: its strobes + ops, vram tracking regs
 //
@@ -100,7 +103,6 @@ module ram_bridge #(
 
     output [15:0]       vram_dout,
     input  [22:0]       vram_addr,   // {2'b10, crtc_addr, 1'b0} from the top level
-    input  [1:0]        vram_bank,   // unused: video always maps to the shared base window
 
     input  [22:0]       tape_addr,
     input  [7:0]        tape_din,
@@ -108,12 +110,7 @@ module ram_bridge #(
     input               tape_wr,
     output              tape_wr_ack,
     input               tape_rd,
-    output reg          tape_rd_ack,
-    input               boot_load,   // loader streaming: video fetches suppressed
-
-    // high unless a CPU read is outstanding (not consumed by the core today,
-    // kept for compatibility with the old port list)
-    output              rdy
+    output reg          tape_rd_ack
 );
 
     assign PSRAM_SCLK  = clk;
@@ -284,33 +281,17 @@ module ram_bridge #(
     reg  old_oe = 1'b0, old_we = 1'b0;
     reg  [7:0] ram_dout;
 
-    // read completion pulse from the chip1 engine (one clk cycle after the
-    // result latches); the consumer of the _old_ value, used to clear
-    // cpu_rd_pending deterministically
-    wire rd_fin;                 // driven in the engine block
-
-    // cpu_rd_pending: set by read capture, cleared by rd_fin
-    reg cpu_rd_pending;
-
-    assign rdy = ~cpu_rd_pending;
     assign dout = (oe | we) ? ram_dout : 8'hFF;
 
     always @(posedge clk) begin
         if (init) begin
             cpu_wp <= 0;
             v_wp <= 0;
-            cpu_rd_pending <= 1'b0;
             old_oe <= 1'b0; old_we <= 1'b0;
         end
         else begin
             old_oe <= oe;
             old_we <= we;
-
-            // cpu_rd_pending: a read edge sets it; engine completion clears it
-            if (rd_fin)
-                cpu_rd_pending <= 1'b0;
-            else if ((~old_oe & oe) & ~we)
-                cpu_rd_pending <= 1'b1;
 
             // capture every CPU/loader edge: CPU requests queue in order,
             // base-window writes are additionally mirrored into the chip-2
@@ -340,9 +321,7 @@ module ram_bridge #(
     reg        e_tape;
     reg [15:0] etmo;
     reg        twr_pl;      // tape write ack pulse
-    reg        rd_fin_pl;   // cpu read completion pulse
 
-    assign rd_fin = rd_fin_pl;
     assign tape_wr_ack = twr_pl;
 
     always @(posedge clk) begin
@@ -353,7 +332,6 @@ module ram_bridge #(
             etmo <= 16'd0;
             cpu_rp <= 0;
             twr_pl <= 1'b0;
-            rd_fin_pl <= 1'b0;
             ram_dout <= 8'hFF;
             tape_dout <= 8'h00;
             tape_rd_ack <= 1'b0;
@@ -362,7 +340,6 @@ module ram_bridge #(
         end
         else begin
             twr_pl <= 1'b0;      // 1-cycle pulses by default
-            rd_fin_pl <= 1'b0;
 
             case (est)
                 E_IDLE: if (~cal_busy) begin
@@ -420,7 +397,6 @@ module ram_bridge #(
                         end
                         else if (!eop[31]) begin
                             ram_dout <= p1_dout[7:0];
-                            rd_fin_pl <= 1'b1;
                         end
                         etmo <= 16'd0;
                         est   <= E_IDLE;
@@ -448,12 +424,11 @@ module ram_bridge #(
     reg         vram_valid;
     reg         vram_dirty;
     reg         vram_inflight;
-    reg         boot_loadq;
 
     assign vram_dout = vram_buf;
     // a fresh fetch is wanted when the live address moved off the buffered
-    // word, the buffer is empty, a mirrored write changed the displayed
-    // word, or boot_load has just ended
+    // word, the buffer is empty, or a mirrored write changed the displayed
+    // word
     wire vram_miss = (vram_live != vram_out_addr) | ~vram_valid | vram_dirty;
 
     always @(posedge clk) begin
@@ -469,19 +444,8 @@ module ram_bridge #(
             vram_valid <= 1'b0;
             vram_dirty <= 1'b0;
             vram_inflight <= 1'b0;
-            boot_loadq <= 1'b0;
         end
         else begin
-            // a loader window starting or ending invalidates the buffered
-            // word, so the first post-boot fetch is a fresh one
-            if (boot_load != boot_loadq) begin
-                boot_loadq    <= boot_load;
-                vram_valid    <= 1'b0;
-                vram_dirty    <= 1'b0;
-                vram_inflight <= 1'b0;
-                vram_out_addr <= 23'h7FFFFF;
-            end
-
             case (est2)
                 E_IDLE: if (~cal_busy) begin
                     if (v_valid) begin
@@ -489,7 +453,7 @@ module ram_bridge #(
                         v_rp <= v_rp + 3'd1;
                         est2 <= E_RDY;
                     end
-                    else if (vram_miss & ~boot_load & ~vram_inflight & ~v_full
+                    else if (vram_miss & ~vram_inflight & ~v_full
                              & (vram_addr[22:16] == 7'd2)) begin
                         eop2 <= {1'b0, 1'b1, 1'b0, 8'h00, {2'b00, vram_live[20:0]}};
                         vram_inflight <= 1'b1;
