@@ -1,9 +1,38 @@
 `timescale 1ns/1ps
 
+// psram -- APS6404L QPI controller, dynamic-phase read capture (2 clocks).
+//
+// Clocks: `clk` (fabric, also the SCLK source) and `clk_cap` (same frequency,
+// phase-shifted by the PLL; its phase is stepped at run time by psram_dps).
+//
+// Read capture: the pad is sampled on BOTH edges of clk_cap
+//     pp: rising  edge  -> instant E(k) + phi          ("P(k)")
+//     pn: falling edge  -> instant E(k) + phi + T/2    ("N(k)")
+// where phi is the current capture phase relative to clk. `cap_sel` (= coarse
+// index c, 0..7) picks which sample is used for read nibble i:
+//     c even: P(15+i+c/2)      c odd: N(15+i+(c-1)/2)
+//     sample instant = E(15+i) + c*T/2 + phi
+// phi is restricted (by the PLL start phase and the sweep length) to a window
+// of one half period inside the "safe zone" of the transfers into clk:
+//     pp -> clk rising edge,  pn -> clk falling edge -> clk rising edge.
+// Within that window the transfers have >= ~0.3 T of setup and ~0.15 T of hold
+// margin, so they never go metastable, whatever the sweep position.
+//
+// cap_sel is latched when a frame is issued; change it only while idle.
+//
+// Costs: read results arrive DRAIN(=5) cycles later, and for cap_sel >= 2 CE#
+// is held low 1..3 cycles longer so the device is still driving when the late
+// sample is taken. CE# high time between frames only gets longer.
 module psram #(
-    parameter integer PWRUP_CYCLES = 30000,   // ~208 us @144 MHz
+    parameter integer PWRUP_CYCLES = 30000,   // ~234 us @128 MHz
     parameter integer RST_CYCLES   = 4000,    // tRST guard
-    parameter integer MID_CYCLES   = 100      // inter-op gap
+    parameter integer MID_CYCLES   = 100,     // inter-op gap
+    //
+    // cycles between CE# release and result assembly (sample-history drain).
+    // 5 is the verified v3 value (sized for the worst-case cap_sel=7 pipeline);
+    // stage 2 of the bring-up will lower it to 2 + cap_sel/2 via the board
+    // takeover without touching the capture logic.
+    parameter integer DRAIN        = 5
 ) (
     input clk,
     input reset,
@@ -13,7 +42,9 @@ module psram #(
     output reg [3:0] sio_out,
     output reg [3:0] sio_oe,
     input [3:0] sio_in,
-    
+    input clk_cap,            // capture clock: clk shifted by phi (PLL outclk_1)
+    input [2:0] cap_sel,      // coarse capture point c (half periods), 0..7
+
     input [22:0] addr,
     input [1:0]  wtbt,
     input rd,
@@ -27,6 +58,8 @@ module psram #(
         SPI_BYTE = 2'd0,
         WR2 = 2'd2,
         RD2 = 2'd3;
+
+    // DRAIN comes from the module parameter (see header). No local override.
 
     localparam [2:0]
         ST_PWRUP = 3'd0,
@@ -49,7 +82,9 @@ module psram #(
 
     reg [1:0] fop = SPI_BYTE;
     reg [6:0] fpcnt = 7'd0;
-    integer flen_m1;
+    integer flen_m1;          // last fpcnt of the frame (incl. drain)
+    integer ce_m1 = 0;        // fpcnt at which CE# is released
+    reg [2:0] sel_q = 3'd3;   // cap_sel latched at frame issue
     reg framer = 1'b0;
     reg fend = 1'b0;
     reg fword = 1'b0;
@@ -85,7 +120,8 @@ module psram #(
                     endcase
                 end
                 RD2: begin
-                    case (p[3:0])
+                    if (p >= 7'd8) drive_val = 4'h0;   // data/drain periods: bus is released
+                    else case (p[3:0])
                         4'h0:    drive_val = 4'he;
                         4'h1:    drive_val = 4'hb;
                         4'h2,4'h3,4'h4,4'h5,4'h6,4'h7:
@@ -129,13 +165,86 @@ module psram #(
         end
     endfunction
 
-    reg cap_en_s = 1'b0;
+    // Extra CE#-low cycles so the device is still driving when a late sample is
+    // taken. Last nibble sampled at E(18) + c*T/2 + phi, phi <= ~0.7 T; keep
+    // CE# low until half a period after that: ext = ceil(c/2 - 0.8), >= 0.
+    function automatic integer rd_ext(input [2:0] cv);
+        case (cv)
+            3'd0, 3'd1: rd_ext = 0;
+            3'd2, 3'd3: rd_ext = 1;
+            3'd4, 3'd5: rd_ext = 2;
+            default:    rd_ext = 3;
+        endcase
+    endfunction
+
+    reg cap_en_s  = 1'b0;
+    reg cap_en_d1 = 1'b0;
+    reg cap_en_d2 = 1'b0;
+    reg cap_en_d3 = 1'b0;
+    reg cap_en_d4 = 1'b0;
+    reg cap_en_d5 = 1'b0;
 
     always @(posedge clk or posedge reset) begin
-        if (reset) cap_en_s <= 1'b0;
-        else cap_en_s <= framer && is_rd(fop) &&
-            (fpcnt >= cap_first(fop)) &&
-            (fpcnt < cap_first(fop) + cap_count(fop));
+        if (reset) begin
+            cap_en_s  <= 1'b0;
+            cap_en_d1 <= 1'b0;
+            cap_en_d2 <= 1'b0;
+            cap_en_d3 <= 1'b0;
+            cap_en_d4 <= 1'b0;
+            cap_en_d5 <= 1'b0;
+        end else begin
+            cap_en_s <= framer && is_rd(fop) &&
+                (fpcnt >= cap_first(fop)) &&
+                (fpcnt < cap_first(fop) + cap_count(fop));
+            // five more stages: the multi-phase sample pipeline needs 5 cycles
+            // after the original capture edge before its newest entry is usable.
+            cap_en_d1 <= cap_en_s;
+            cap_en_d2 <= cap_en_d1;
+            cap_en_d3 <= cap_en_d2;
+            cap_en_d4 <= cap_en_d3;
+            cap_en_d5 <= cap_en_d4;
+        end
+    end
+
+    // ---------------------------------------- dynamic-phase pad sampling
+    // clk_cap domain: one flop per edge (the pad path is untimed).
+    reg [3:0] pp = 4'h0;                 // E(k) + phi
+    reg [3:0] pn = 4'h0;                 // E(k) + phi + T/2
+    always @(posedge clk_cap) pp <= sio_in;
+    always @(negedge clk_cap) pn <= sio_in;
+
+    // pn is re-timed on the falling edge of clk (>= 0.35 T available), then
+    // both streams are in the clk posedge domain. After edge E(m):
+    //   sp2 = P(m-2)   sn1 = N(m-2)      (same period k = m-2)
+    reg [3:0] mn  = 4'h0;
+    reg [3:0] sp1 = 4'h0, sp2 = 4'h0, sn1 = 4'h0;
+    always @(negedge clk) mn <= pn;
+    always @(posedge clk) begin
+        sp1 <= pp;
+        sp2 <= sp1;
+        sn1 <= mn;
+    end
+
+    // Choose P or N (parity of c), then a 4-deep period history. After E(n):
+    //   pick = X(n-3), pk0 = X(n-4), pk1 = X(n-5), pk2 = X(n-6)
+    reg [3:0] pick = 4'h0, pk0 = 4'h0, pk1 = 4'h0, pk2 = 4'h0;
+    always @(posedge clk) begin
+        pick <= sel_q[0] ? sn1 : sp2;
+        pk0  <= pick;
+        pk1  <= pk0;
+        pk2  <= pk1;
+    end
+
+    // Nibble i is written at W = 22+i; period k = 15+i+c/2 is then in
+    // tap (3 - c/2): pick, pk0, pk1, pk2.
+    reg [3:0] cap_tap;
+    always @* begin
+        case (sel_q[2:1])
+            2'd3:    cap_tap = pick;
+            2'd2:    cap_tap = pk0;
+            2'd1:    cap_tap = pk1;
+            default: cap_tap = pk2;
+        endcase
     end
 
     // ------------------------------------------------------- TX / engine core
@@ -163,7 +272,11 @@ module psram #(
                             (is_rd(fop) && (fpcnt + 7'd1) >= cap_first(fop)))
                            ? 4'h0 : 4'hf;
                 // ---- advance ----
-                if (fpcnt == flen_m1) begin
+                if (fpcnt == ce_m1) begin          // CE# release
+                    ce_n   <= 1'b1;
+                    sio_oe <= 4'h0;
+                end
+                if (fpcnt == flen_m1) begin        // frame (incl. drain) done
                     framer <= 1'b0;
                     ce_n   <= 1'b1;
                     sio_oe <= 4'h0;
@@ -251,7 +364,9 @@ module psram #(
                             input [7:0] d0, input [7:0] d1);
         begin
             fop <= op;
-            flen_m1 = len - 1;
+            ce_m1   = len - 1 + (is_rd(op) ? rd_ext(cap_sel) : 0);
+            flen_m1 = ce_m1   + (is_rd(op) ? DRAIN           : 0);
+            sel_q   <= cap_sel;
             s_cmd = cmd;
             raddr = ba;
             wd0 = d0;
@@ -275,8 +390,8 @@ module psram #(
             rnib[3] <= 4'h0;
             nidx    <= 2'd0;
         end else begin
-            if (cap_en_s) begin
-                rnib[nidx] <= sio_in[3:0];
+            if (cap_en_d5) begin
+                rnib[nidx] <= cap_tap;
                 nidx <= nidx + 2'd1;
             end else begin
                 nidx <= 2'd0;   // idle -> ready for the next read frame

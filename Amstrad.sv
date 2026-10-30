@@ -127,17 +127,42 @@ localparam CONF_STR = {
 
 wire clk_sys;
 wire clk_ram;
+wire clk_cap;		// PLL outclk_2: PSRAM capture clock (DPS phase-stepped)
 wire locked;
 wire st_right_shift_mod = status[22];
 wire st_keypad_mod = status[23];
 wire st_progressbar = status[31];
 wire clk_psram = clk_ram;
+
+// ram_bridge drives the PLL's dynamic phase shift ports: capture-clock
+// stepping for the PSRAM read calibration (C2 = outclk_2).
+wire        br_phase_en, br_updn, br_phase_done;
+wire [4:0]  br_cntsel;
+wire        cal_done, cal_fail, cal_busy;
+wire [63:0] cal_status;
+
+// cal_done lives in the clk_ram domain; synchronise it into clk_sys (2FF) so
+// the core reset and the loader wait can be held until both PSRAM chips are
+// calibrated. On a calibration failure cal_done still rises (cal3 falls back
+// to DEF_C), so the core always boots.
+reg cal_done_s0, cal_done_s1;
+always @(posedge clk_sys) begin
+	cal_done_s0 <= cal_done;
+	cal_done_s1 <= cal_done_s0;
+end
+wire cal_ready = cal_done_s1;
+
 pll pll
 (
 	.refclk(CLK_50M),
 	.outclk_0(clk_sys),
     .outclk_1(clk_ram),
-	.locked(locked)
+    .outclk_2(clk_cap),
+	.locked(locked),
+	.phase_en(br_phase_en),
+	.updn(br_updn),
+	.cntsel(br_cntsel),
+	.phase_done(br_phase_done)
 );
 
 reg ce_ref, ce_u765;
@@ -295,7 +320,7 @@ reg   [1:0] sna_rle_state = 2'd0;
 reg   [7:0] sna_rle_count = 8'd0;
 reg   [7:0] sna_rle_value = 8'd0;
 
-assign ioctl_wait = romdl_wait | (sna_download && |sna_rle_count && (sna_rle_state == 2'd0));
+assign ioctl_wait = ~cal_ready | romdl_wait | (sna_download && |sna_rle_count && (sna_rle_state == 2'd0));
 
 function automatic [1:0] valid_model(input [1:0] requested);
 	begin
@@ -651,11 +676,30 @@ wire [14:0] vram_addr;
 ram_bridge ram_bridge(
 	.init(~locked),
 	.clk(clk_ram),
+	.clk_cap(clk_cap),
+	.scanclk(CLK_50M),
+	.pll_phase_en(br_phase_en),
+	.pll_updn(br_updn),
+	.pll_cntsel(br_cntsel),
+	.pll_phase_done(br_phase_done),
+	.cal_done(cal_done),
+	.cal_fail(cal_fail),
+	.cal_busy(cal_busy),
+	.cal_status(cal_status),
+
+	// chip 1 (U1): CPU / loader / tape RAM
 	.PSRAM_SCLK(PSRAM_SCLK),
 	.PSRAM_CE_N(PSRAM_CE_N),
 	.PSRAM_SIO_OUT(PSRAM_SIO_OUT),
 	.PSRAM_SIO_OE(PSRAM_SIO_OE),
 	.PSRAM_SIO_IN(PSRAM_SIO_IN),
+
+	// chip 2 (U2): base-64K shadow / video
+	.PSRAM2_SCLK(PSRAM2_SCLK),
+	.PSRAM2_CE_N(PSRAM2_CE_N),
+	.PSRAM2_SIO_OUT(PSRAM2_SIO_OUT),
+	.PSRAM2_SIO_OE(PSRAM2_SIO_OE),
+	.PSRAM2_SIO_IN(PSRAM2_SIO_IN),
 
 	.oe  (use_boot ? 1'b0      : mem_rd & ~mf2_ram_en),
 	.we  (use_boot ? boot_wr   : mem_wr & ~mf2_ram_en & ~mf2_rom_en),
@@ -684,7 +728,7 @@ always @(posedge clk_sys) begin
 	if(sna_load) model <= sna_model;
 	else if(reset) model <= menu_model;
 	old_sna_download_reset <= sna_download;
-	reset <= RESET | status[0] | status[32] | buttons[1] | rom_download | key_reset | dan_download |
+	reset <= RESET | ~cal_ready | status[0] | status[32] | buttons[1] | rom_download | key_reset | dan_download |
 	         sna_download | sna_finish_pending | (old_sna_download_reset & ~sna_download) | (sna_apply_cnt > 3'd2);
 end
 
