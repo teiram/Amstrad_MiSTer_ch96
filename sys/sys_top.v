@@ -71,6 +71,8 @@ module sys_top
 	output  [3:0] PSRAM2_SIO_OE,
 	input   [3:0] PSRAM2_SIO_IN,
 
+    output FAN_PWM,
+    
 `ifdef MISTER_DUAL_SDRAM
 	////////// SDR #2 //////////
 	output [12:0] SDRAM2_A,
@@ -612,6 +614,19 @@ always @(posedge FPGA_CLK2_50) begin
 	resetd2 <= resetd;
 end
 
+///////////////////////////  FAN PWM  ///////////////////////////////////
+
+reg pwm_reg = 1'b0;
+localparam [19:0] PWM_DUTY_CYCLE = 20'd524288;
+always @(posedge FPGA_CLK2_50) begin
+    reg [19:0] counter;
+    counter <= counter + 1'b1;
+    
+    if (counter > PWM_DUTY_CYCLE) pwm_reg <= 1'b1;
+    else pwm_reg <= 1'b0;
+end
+
+assign FAN_PWM = pwm_reg;
 ////////////////////  SYSTEM MEMORY & SCALER  /////////////////////////
 
 wire reset;

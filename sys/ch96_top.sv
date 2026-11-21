@@ -65,6 +65,8 @@ module ch96_top
 		.PSRAM2_SIO_OE(PSRAM2_SIO_OE),
 		.PSRAM2_SIO_IN(PSRAM2_SIO_IN),
 
+        .FAN_PWM(FAN_PWM),
+        
 		//////////// HDMI I2C (HPS I2C2 -> TDA19988) //////////
 		.HDMI_I2C_SCL(I2C2_SCL),
 		.HDMI_I2C_SDA(I2C2_SDA),
@@ -160,6 +162,9 @@ module ch96_top
 	wire  [3:0] PSRAM2_SIO_OE;
 	wire  [3:0] PSRAM2_SIO_IN;
     
+    // PWM signal for fan control
+    wire FAN_PWM;
+    
 	// The four user LEDs (D5-D8) are HPS GPIO14/22/25/32 (I11/H11/G10/F11),
 	// muxed to LoanIO in the hps-ch96 handoff, so the FPGA drives them through
 	// the loan_io bus. Board LEDs are active-high (1 = lit, as exercised by
@@ -233,4 +238,7 @@ module ch96_top
 	assign LED_YELLOW = led[1];
 	assign LED_BLUE   = led[3];
 
+    // PWM for fan
+    assign loan_io_oe[49] = 1'b1;
+    assign loan_io_out[49] = FAN_PWM;
 endmodule
